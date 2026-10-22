@@ -24,7 +24,9 @@ trap cleanup EXIT
 # --- Prerequisites ---
 
 curl -sf http://localhost:7070/v1/info >/dev/null 2>&1 || die "arkd not running on :7070"
-curl -sf http://localhost:7001/api/v1/wallet/status >/dev/null 2>&1 || die "fulmine not running on :7001"
+FULMINE_URL="${FULMINE_URL:-http://localhost:7001}"
+export FULMINE_URL
+curl -sf "$FULMINE_URL/api/v1/wallet/status" >/dev/null 2>&1 || die "fulmine not running at $FULMINE_URL"
 
 # --- Fixed keys for the test ---
 
@@ -37,8 +39,13 @@ BOB_SK="0000000000000000000000000000000000000000000000000000000000000002"
 # --- Build ---
 
 log "Building Rust native extension..."
-cargo build -p ark-escrow-ruby 2>&1 | tail -1
-cd target/debug && ln -sf libark_escrow_ruby.so ark_escrow_ruby.so && cd "$ROOT"
+ARK_ESCROW_DIR="${ARK_ESCROW_DIR:-$ROOT/ark-escrow}"
+[ -f "$ARK_ESCROW_DIR/Cargo.toml" ] || die "ark-escrow submodule missing; run: git submodule update --init"
+(cd "$ARK_ESCROW_DIR" && cargo build -p ark-escrow-ruby 2>&1 | tail -1)
+(cd "$ARK_ESCROW_DIR/target/debug" && \
+  if [ -f libark_escrow_ruby.dylib ]; then ln -sf libark_escrow_ruby.dylib ark_escrow_ruby.bundle; \
+  else ln -sf libark_escrow_ruby.so ark_escrow_ruby.so; fi)
+export ARK_ESCROW_DIR
 logok "Native extension built"
 
 # --- Install deps ---

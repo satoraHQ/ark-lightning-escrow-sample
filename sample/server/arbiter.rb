@@ -34,14 +34,20 @@ FEE_OUTPUTS_JSON = ENV.fetch("FEE_OUTPUTS_JSON", "[]")
 
 TRADES = {}
 
-# Demo-only store for crash-recovery state during offchain release finalization.
-# This keeps the sample self-contained and shows the callback-based API.
-# For real crash recovery across process restarts, back this with a database.
+# Demo-only store for the offchain spend records the gem writes around
+# submit/finalize. This keeps the sample self-contained and shows the
+# callback-based API. For real crash recovery across process restarts, back
+# this with a database.
 #
-# For now, the app also depends on this store to infer whether an offchain spend
-# is already pending for a trade. Arkade should eventually surface pending spend
-# status for escrow VTXOs explicitly, but until then the local spend store is
-# the source of truth for retrying offchain finalization safely.
+# The gem writes a record *before* submit, upgrades it after submit, and keeps
+# it at stage "finalized" after finalize: the finalized record holds the
+# server's verified co-signature and the fully-signed checkpoints, the parties'
+# evidence of the payout. Prune finalized records under your own retention
+# policy; `get_escrow_vtxo_status` does not count them as pending.
+#
+# `remove_if` and `save_if` are optional compare-and-write hooks keyed on the
+# record's per-attempt token. With a database, implement them as a single
+# `DELETE ... WHERE id = ? AND (token = ? OR token IS NULL)` / `UPDATE ...`.
 class CallbackSpendStore
   def initialize
     @data = {}
@@ -50,13 +56,13 @@ class CallbackSpendStore
 
   def save(id, json)
     @lock.synchronize { @data[id] = json }
-    warn "[SpendStore] save #{id}"
+    warn "[SpendStore] save #{id} (#{stage_of(json)})"
     nil
   end
 
   def load(id)
     value = @lock.synchronize { @data[id] }
-    warn "[SpendStore] load #{id} => #{value.nil? ? 'miss' : 'hit'}"
+    warn "[SpendStore] load #{id} => #{value.nil? ? 'miss' : stage_of(value)}"
     value
   end
 
@@ -64,6 +70,45 @@ class CallbackSpendStore
     removed = @lock.synchronize { @data.delete(id) }
     warn "[SpendStore] remove #{id}#{removed.nil? ? ' (noop)' : ''}"
     nil
+  end
+
+  # Delete only if the stored record carries `token` (or none). Returns whether
+  # a record was deleted.
+  def remove_if(id, token)
+    @lock.synchronize do
+      next false unless token_matches?(@data[id], token)
+
+      @data.delete(id)
+      warn "[SpendStore] remove_if #{id}"
+      true
+    end
+  end
+
+  # Overwrite only if the stored record carries `token` (or none). Returns
+  # whether the record was written.
+  def save_if(id, json, token)
+    @lock.synchronize do
+      next false unless token_matches?(@data[id], token)
+
+      @data[id] = json
+      warn "[SpendStore] save_if #{id} (#{stage_of(json)})"
+      true
+    end
+  end
+
+  private
+
+  def token_matches?(json, token)
+    return false if json.nil?
+
+    stored = JSON.parse(json)["token"].to_s
+    stored.empty? || stored == token
+  end
+
+  def stage_of(json)
+    JSON.parse(json)["stage"] || "submitted"
+  rescue JSON::ParserError
+    "?"
   end
 end
 
@@ -265,6 +310,8 @@ post "/trades/:id/refresh-bob" do
       intent_message: trade[:refresh_intent_message_json],
       intent_proof_psbt: trade[:refresh_intent_b64],
       forfeit_psbts: trade[:refresh_forfeit_psbts_b64],
+      delete_proof_psbt: trade[:refresh_delete_proof_b64],
+      delete_message: trade[:refresh_delete_message_json],
       retry: true,
     )
   end
@@ -280,7 +327,12 @@ post "/trades/:id/refresh-bob" do
   end
 
   warn "  preparing Bob refresh: vtxos=#{vtxos_data.length}, any_recoverable=#{release_plan[:any_recoverable]}"
-  intent_proof_b64, intent_message_json, forfeit_psbts_b64, cosigner_pk_hex =
+  # The delete proof covers the same inputs and is signed by the same parties
+  # in the same round. With it, the gem clears a stale intent left by an
+  # earlier attempt and withdraws its own intent if the ceremony fails. It is
+  # valid for 24 h; a trade retrying older material must prepare again.
+  intent_proof_b64, intent_message_json, forfeit_psbts_b64, cosigner_pk_hex,
+    delete_proof_b64, delete_message_json =
     CLIENT.prepare_refresh(
       trade[:contract],
       vtxos_data,
@@ -288,12 +340,14 @@ post "/trades/:id/refresh-bob" do
       ARBITER_SK,
     )
 
-  arbiter_signed_intent, arbiter_signed_forfeits =
-    ArkEscrow.sign_refresh(intent_proof_b64, forfeit_psbts_b64, ARBITER_SK)
+  arbiter_signed_intent, arbiter_signed_forfeits, arbiter_signed_delete =
+    ArkEscrow.sign_refresh(intent_proof_b64, forfeit_psbts_b64, ARBITER_SK, delete_proof_b64)
 
   trade[:refresh_intent_b64] = arbiter_signed_intent
   trade[:refresh_intent_message_json] = intent_message_json
   trade[:refresh_forfeit_psbts_b64] = arbiter_signed_forfeits
+  trade[:refresh_delete_proof_b64] = arbiter_signed_delete
+  trade[:refresh_delete_message_json] = delete_message_json
   trade[:refresh_cosigner_pk_hex] = cosigner_pk_hex
   trade[:refresh_previous_outpoint] = trade[:escrow_outpoint]
   trade[:status] = "refreshing_escrow"
@@ -306,6 +360,8 @@ post "/trades/:id/refresh-bob" do
     intent_message: intent_message_json,
     intent_proof_psbt: arbiter_signed_intent,
     forfeit_psbts: arbiter_signed_forfeits,
+    delete_proof_psbt: arbiter_signed_delete,
+    delete_message: delete_message_json,
   )
 end
 
@@ -384,12 +440,16 @@ end
 
 # Complete release — Bob's co-signed PSBTs → merge, submit, finalize.
 #
-# The `finalize_release` method on the client handles:
-# 1. Submitting the merged ark_tx + unsigned checkpoints to Arkade
-# 2. Persisting the pending state (crash recovery)
-# 3. Merging all checkpoint signatures (server + each party)
-# 4. Finalizing the offchain transaction
-# 5. Cleaning up the pending state
+# `spend_escrow_offchain` handles:
+# 1. Recording the spend in the store *before* submit (crash recovery)
+# 2. Submitting the merged ark_tx + unsigned checkpoints to Arkade
+# 3. Verifying the server co-signed the ark_tx before any checkpoint
+#    signature is released
+# 4. Merging all checkpoint signatures (server + each party)
+# 5. Finalizing the offchain transaction and keeping the record as evidence
+#
+# Calling it again with the same trade ID resumes from the recorded stage;
+# `resume_pending_spend(trade_id)` does the same without re-supplying PSBTs.
 post "/trades/:id/release/sign" do
   trade = find_trade!(params[:id])
   assert_status!(trade, "releasing_offchain")
@@ -414,6 +474,8 @@ post "/trades/:id/release/sign" do
       [trade[:arbiter_signed_checkpoint_txs_b64], bob_signed_checkpoints],
     )
   rescue => e
+    # The record (if any) is kept; a retry of this endpoint, or
+    # `resume_pending_spend`, continues from where it stopped.
     halt 500, json(error: "finalize failed: #{e.message}")
   end
 
@@ -430,6 +492,7 @@ post "/trades/:id/refresh-bob/sign" do
   body = JSON.parse(request.body.read)
   bob_signed_intent = body["signed_intent_proof"]
   bob_signed_forfeits = body["signed_forfeit_psbts"]
+  bob_signed_delete = body["signed_delete_proof"] # optional, older clients omit it
   halt 400, json(error: "missing signed_intent_proof") unless bob_signed_intent
   halt 400, json(error: "missing signed_forfeit_psbts") unless bob_signed_forfeits
 
@@ -441,12 +504,24 @@ post "/trades/:id/refresh-bob/sign" do
     ArkEscrow.merge_sigs(arb, bob)
   end
 
+  # Merge arbiter + Bob signatures on the delete proof, if Bob signed it.
+  merged_delete = nil
+  delete_message = nil
+  if bob_signed_delete && trade[:refresh_delete_proof_b64]
+    merged_delete = ArkEscrow.merge_sigs(trade[:refresh_delete_proof_b64], bob_signed_delete)
+    delete_message = trade[:refresh_delete_message_json]
+  else
+    warn "  no co-signed delete proof: stale refresh intents will not be cleared automatically"
+  end
+
   begin
     commitment_txid = CLIENT.refresh_escrow(
       merged_intent,
       trade[:refresh_intent_message_json],
       merged_forfeits,
       ARBITER_SK,
+      merged_delete,
+      delete_message,
     )
     warn "  escrow refreshed: commitment_txid=#{commitment_txid}"
   rescue => e
@@ -464,6 +539,8 @@ post "/trades/:id/refresh-bob/sign" do
   trade[:refresh_intent_b64] = nil
   trade[:refresh_intent_message_json] = nil
   trade[:refresh_forfeit_psbts_b64] = nil
+  trade[:refresh_delete_proof_b64] = nil
+  trade[:refresh_delete_message_json] = nil
   trade[:refresh_cosigner_pk_hex] = nil
   trade[:refresh_previous_outpoint] = nil
   trade[:status] = "attested"
