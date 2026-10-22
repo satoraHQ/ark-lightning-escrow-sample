@@ -24,7 +24,9 @@ trap cleanup EXIT
 # --- Prerequisites ---
 
 curl -sf http://localhost:7070/v1/info >/dev/null 2>&1 || die "arkd not running on :7070"
-curl -sf http://localhost:7001/api/v1/wallet/status >/dev/null 2>&1 || die "fulmine not running on :7001"
+FULMINE_URL="${FULMINE_URL:-http://localhost:7001}"
+export FULMINE_URL
+curl -sf "$FULMINE_URL/api/v1/wallet/status" >/dev/null 2>&1 || die "fulmine not running at $FULMINE_URL"
 
 # --- Fixed keys for the test ---
 
