@@ -1,4 +1,4 @@
 [submodule "ark-escrow"]
 	path = ark-escrow
-	url = https://github.com/lendasat/ark-escrow.git
+	url = https://github.com/satoraHQ/arkade-lightning-2of3-escrow.git
 	branch = master

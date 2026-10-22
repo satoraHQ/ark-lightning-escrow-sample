@@ -386,11 +386,20 @@ async function refreshEscrowIfNeeded(
     refresh.forfeit_psbts,
     bobSk,
   );
+  // The delete proof is an intent proof over the same inputs; signing it lets
+  // the arbiter clear a stale intent from an earlier attempt and withdraw this
+  // one if the batch fails. Same key, same signing step, no extra interaction.
+  let signedDeleteProof: string | undefined;
+  if (refresh.delete_proof_psbt) {
+    const signed = await signEscrowRefresh(refresh.delete_proof_psbt, [], bobSk);
+    signedDeleteProof = signed.signedIntentProof;
+  }
 
   showProgress("Refreshing escrow via Arkade batch (this may take ~30s)...");
   await api("POST", `/trades/${tradeId}/refresh-bob/sign`, {
     signed_intent_proof: signedIntentProof,
     signed_forfeit_psbts: signedForfeitPsbts,
+    signed_delete_proof: signedDeleteProof,
   });
 
   const refreshedTrade = await getTrade(tradeId);

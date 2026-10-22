@@ -13,7 +13,7 @@ A list of things outside the happy path.
 ## Escrow server fails to complete 2-step offchain transaction protocol (to claim or refund)
 
 - Once the offchain transaction has been registered with the server, if the finalization doesn't happen (transient error), one cannot just use the same VTXO as an input in another offchain transaction.
-- To retry one has to use the `GetPendingTxs` API on the Arkade server/indexer. That returns the original Arkade transaction + checkpoint transactions, and the arbiter can retry finalization.
+- The gem records the spend in its store *before* submit and keeps the record through finalize, so a crash or lost response at any point is retried by calling `spend_escrow_offchain` again with the same trade ID, or `resume_pending_spend(trade_id)`. The one case it cannot finish alone is a response lost *after* Arkade accepted the submit: Arkade answers the re-submit with "duplicated offchain tx" and keeps the input locked; the record stays at `submitting` for an operator, who needs Arkade's `GetPendingTx` with a proof co-signed by both parties to recover the server's checkpoint signatures.
 
 _`ark-escrow` now covers this._
 
