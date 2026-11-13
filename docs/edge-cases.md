@@ -10,10 +10,12 @@ A list of things outside the happy path.
 
 - Retry creating the LN-Arkade swap (client-side).
 
-## Escrow server fails to complete 2-step offchain transaction protocol (to claim or refund)
+## Escrow server fails to complete the offchain transaction (to claim or refund)
 
-- Once the offchain transaction has been registered with the server, if the finalization doesn't happen (transient error), one cannot just use the same VTXO as an input in another offchain transaction.
-- The gem records the spend in its store *before* submit and keeps the record through finalize, so a crash or lost response at any point is retried by calling `spend_escrow_offchain` again with the same trade ID, or `resume_pending_spend(trade_id)`. The one case it cannot finish alone is a response lost *after* Arkade accepted the submit: Arkade answers the re-submit with "duplicated offchain tx" and keeps the input locked; the record stays at `submitting` for an operator, who needs Arkade's `GetPendingTx` with a proof co-signed by both parties to recover the server's checkpoint signatures.
+- The gem submits the checkpoints fully signed, so Arkade finalizes within the `submit` call (one-shot submit). A spend is no longer left "registered but not finalized" because the arbiter stopped between two calls.
+- What can still go wrong is the arbiter not learning the outcome: a timeout or crash after Arkade accepted the submit. An error from `spend_escrow_offchain` therefore does not mean the escrow is unspent.
+- The gem records the spend in its store *before* submit, so the fix is to call `spend_escrow_offchain` again with the same trade ID, or `resume_pending_spend(trade_id)`. Arkade answers the re-submit with "duplicated offchain tx"; the gem then reads the co-signed ark tx and the server-signed checkpoints back from the indexer, verifies them, and finalizes (a no-op if Arkade already had).
+- The one case it cannot finish alone is an indexer that does not serve the server's signatures: the record stays at `submitting` and a later retry tries again.
 
 _`ark-escrow` now covers this._
 
