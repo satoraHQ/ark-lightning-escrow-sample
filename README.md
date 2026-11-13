@@ -79,7 +79,7 @@ FEE_OUTPUTS_JSON='[["tark1q...",500],["tark1q...",400]]'
 5. **Create swap** — Bob creates the Lightning swap only after the escrow is spendable
 6. **Release** — Arbiter builds release tx with signer set `buyer_arbiter`, signs everything, returns PSBTs to Bob
 7. **Sign** — Bob signs all PSBTs in one round (`signEscrowArkTx()` + `signEscrowCheckpoints()`)
-8. **Complete** — Arbiter merges signatures, submits to Arkade, finalizes
+8. **Complete** — Arbiter merges signatures and submits to Arkade, which finalizes in the same call
 
 If the escrow VTXO has become recoverable (expired from the VTXO tree), the frontend performs an explicit escrow **refresh** before creating the Lightning swap/VHTLC, then proceeds with the normal offchain release. Bob can also tick “refresh before claim” to exercise this flow even when the escrow is already spendable; the backend logs a warning in that case.
 
@@ -104,14 +104,18 @@ The frontend uses `releasable_amount` as the source amount when creating the Lig
     │<── all signed ────────────────│  (single round)             │
     │                               │                             │
     │ merge ark_tx sigs             │                             │
-    │ submit(ark_tx, UNSIGNED cps) ─────────────────────────────>│
-    │<──────────── server-signed cps ────────────────────────────│
-    │                               │                             │
     │ merge all cp sigs             │                             │
-    │ finalize(txid, merged cps) ───────────────────────────────>│
+    │ submit(ark_tx, SIGNED cps) ───────────────────────────────>│
+    │<──── co-signed ark_tx + fully-signed cps (finalized) ──────│
+    │                               │                             │
+    │ verify server signatures      │                             │
 ```
 
-**Security invariant**: checkpoint signatures are never sent to Arkade before
-the server co-signs the ark_tx. Only unsigned checkpoints go in the `submit`
-call; arbiter + Bob checkpoint sigs are merged into the server-signed copies
-afterwards.
+**One-shot submit**: the checkpoints go to Arkade already carrying the arbiter's
+and Bob's signatures, and the server co-signs and finalizes in the same call.
+There is no window between `submit` and `finalize` in which an interrupted
+arbiter leaves the spend pending. The price is that the server receives the
+checkpoint signatures before it returns its co-signature on the ark_tx; see
+[the escrow protocol doc](https://github.com/satoraHQ/arkade-lightning-2of3-escrow/blob/master/docs/protocol.md)
+for the trade-off. A separate `finalize` is only sent if the server accepted
+the spend without finalizing it.

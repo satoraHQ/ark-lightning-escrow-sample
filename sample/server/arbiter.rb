@@ -35,12 +35,12 @@ FEE_OUTPUTS_JSON = ENV.fetch("FEE_OUTPUTS_JSON", "[]")
 TRADES = {}
 
 # Demo-only store for the offchain spend records the gem writes around
-# submit/finalize. This keeps the sample self-contained and shows the
+# submit. This keeps the sample self-contained and shows the
 # callback-based API. For real crash recovery across process restarts, back
 # this with a database.
 #
-# The gem writes a record *before* submit, upgrades it after submit, and keeps
-# it at stage "finalized" after finalize: the finalized record holds the
+# The gem writes a record *before* submit and keeps it at stage "finalized"
+# once Arkade has finalized the spend: the finalized record holds the
 # server's verified co-signature and the fully-signed checkpoints, the parties'
 # evidence of the payout. Prune finalized records under your own retention
 # policy; `get_escrow_vtxo_status` does not count them as pending.
@@ -416,7 +416,8 @@ post "/trades/:id/release" do
     "buyer_arbiter",
   )
 
-  # Keep unsigned checkpoints — these go to Arkade at submit time
+  # Keep the unsigned checkpoints — the gem merges both parties' signatures
+  # into them and submits the result
   trade[:unsigned_checkpoint_txs_b64] = checkpoint_txs_b64
 
   # Arbiter signs everything
@@ -438,15 +439,17 @@ post "/trades/:id/release" do
   )
 end
 
-# Complete release — Bob's co-signed PSBTs → merge, submit, finalize.
+# Complete release — Bob's co-signed PSBTs → merge, submit (Arkade finalizes
+# in the same call).
 #
 # `spend_escrow_offchain` handles:
 # 1. Recording the spend in the store *before* submit (crash recovery)
-# 2. Submitting the merged ark_tx + unsigned checkpoints to Arkade
-# 3. Verifying the server co-signed the ark_tx before any checkpoint
-#    signature is released
-# 4. Merging all checkpoint signatures (server + each party)
-# 5. Finalizing the offchain transaction and keeping the record as evidence
+# 2. Merging all party checkpoint signatures into the checkpoints
+# 3. Submitting the merged ark_tx + signed checkpoints to Arkade (one-shot
+#    submit: the server co-signs and finalizes within this call)
+# 4. Verifying the server's co-signature on the ark_tx and its signatures on
+#    the checkpoints, and keeping the record as evidence
+# 5. Finalizing separately only if the server accepted without finalizing
 #
 # Calling it again with the same trade ID resumes from the recorded stage;
 # `resume_pending_spend(trade_id)` does the same without re-supplying PSBTs.
@@ -463,9 +466,10 @@ post "/trades/:id/release/sign" do
   # Merge ark_tx signatures: arbiter + Bob
   merged_ark_tx = ArkEscrow.merge_sigs(trade[:arbiter_signed_ark_tx_b64], bob_signed_ark_tx)
 
-  # Guarded finalize: submit → persist → merge checkpoints → finalize → cleanup.
-  # On crash between submit and finalize, the next call with the same trade ID
-  # will resume from the persisted state.
+  # Guarded spend: persist → submit (finalizes) → record as finalized.
+  # An error here does not mean the escrow is unspent: Arkade may have
+  # finalized before the response was lost. The next call with the same trade
+  # ID resumes from the persisted state and recovers such a spend.
   begin
     ark_txid = CLIENT.spend_escrow_offchain(
       trade[:id],
@@ -476,7 +480,7 @@ post "/trades/:id/release/sign" do
   rescue => e
     # The record (if any) is kept; a retry of this endpoint, or
     # `resume_pending_spend`, continues from where it stopped.
-    halt 500, json(error: "finalize failed: #{e.message}")
+    halt 500, json(error: "release failed: #{e.message}")
   end
 
   trade[:status] = "completed"

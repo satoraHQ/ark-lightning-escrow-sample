@@ -71,7 +71,7 @@ cd "$ROOT"
 
 # Wait for server to be ready (404 is fine — it means the server is up)
 for i in $(seq 1 30); do
-    HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' http://localhost:4567/trades/nonexistent 2>/dev/null || echo "000")
+    HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' http://localhost:4567/trades/nonexistent 2>/dev/null || true)
     if [ "$HTTP_CODE" != "000" ]; then
         break
     fi
@@ -82,7 +82,7 @@ for i in $(seq 1 30); do
     fi
     sleep 0.5
 done
-HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' http://localhost:4567/trades/nonexistent 2>/dev/null || echo "000")
+HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' http://localhost:4567/trades/nonexistent 2>/dev/null || true)
 if [ "$HTTP_CODE" = "000" ]; then
     echo "--- Server log ---"
     cat e2e/server.log
